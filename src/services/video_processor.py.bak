@@ -1,0 +1,454 @@
+import os
+import json
+import logging
+from moviepy.editor import VideoFileClip
+from dataclasses import asdict
+from .transcription import TranscriptionService, TranscriptionRequest
+from .analysis_service import AnalysisService
+from .guide_generator import GuideGenerator
+from fastapi import WebSocket
+from typing import Dict, Any, Optional, Tuple
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+# Configuração do logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class VideoProcessor:
+    def __init__(self, manager, client_id: str, transcription_service: TranscriptionService, temp_dir="temp"):
+        self.manager = manager
+        self.client_id = client_id
+        self.transcription_service = transcription_service
+        self.analysis_service = AnalysisService()
+        self.guide_generator = GuideGenerator()
+        self.temp_dir = temp_dir
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+    def _extract_audio(self, file_path):
+        """Extrai o áudio de um arquivo (vídeo ou áudio)."""
+        try:
+            # Verifica a extensão do arquivo para determinar se é áudio ou vídeo
+            file_extension = os.path.splitext(file_path)[1].lower()
+            audio_path = os.path.splitext(file_path)[0] + '.wav'
+            
+            # Se for um arquivo de áudio, converter diretamente
+            if file_extension in ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a']:
+                logger.info(f"Arquivo de áudio detectado: {file_extension}. Convertendo para WAV...")
+                # Usar FFmpeg diretamente para converter áudio
+                import subprocess
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', file_path, '-acodec', 'pcm_s16le', audio_path],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+            else:
+                # Arquivo de vídeo - extrair o áudio normalmente
+                logger.info(f"Arquivo de vídeo detectado: {file_extension}. Extraindo áudio...")
+                video_clip = VideoFileClip(file_path)
+                video_clip.audio.write_audiofile(audio_path, codec='pcm_s16le')
+                video_clip.close()
+                
+            return audio_path
+        except Exception as e:
+            logger.error(f"Erro ao processar áudio/vídeo: {e}")
+            raise
+
+    def seconds_to_frames(self, seconds, fps):
+        """Converte segundos para frames com alta precisão."""
+        # Primeiro multiplica, depois arredonda para o frame mais próximo
+        # Isso é importante para evitar erros de precisão em frações pequenas
+        exact_frames = seconds * fps
+        
+        # Verifica se estamos próximos de um frame inteiro para evitar erros de arredondamento
+        frame_threshold = 0.002  # 2ms de margem de erro
+        nearest_frame = round(exact_frames)
+        
+        # Se estamos muito próximos de um frame inteiro, use-o
+        if abs(exact_frames - nearest_frame) < frame_threshold:
+            result = nearest_frame
+        else:
+            # Caso contrário, use truncamento para evitar incluir frames parciais
+            result = int(exact_frames)
+            
+        logger.debug(f"Convertendo {seconds} segundos @ {fps} fps = {result} frames")
+        return result
+
+    def _time_str_to_seconds(self, time_value):
+        """Converte um valor de tempo para segundos.
+        Aceita múltiplos formatos:
+        - Número (float/int): já interpretado como segundos
+        - String no formato HH:MM:SS.mmm
+        - String no formato MM:SS.mmm
+        - String com número puro
+        """
+        try:
+            # Se já for um número, retorna diretamente
+            if isinstance(time_value, (int, float)):
+                return float(time_value)
+                
+            # Limpa a string e remove espaços extras
+            time_str = str(time_value).strip()
+            
+            # Verificar se já é um número em formato string
+            if time_str.replace('.', '', 1).isdigit():
+                return float(time_str)
+                
+            # Formato HH:MM:SS.mmm
+            if time_str.count(':') == 2:
+                h, m, s = time_str.split(':')
+                total_seconds = int(h) * 3600 + int(m) * 60 + float(s)
+                
+            # Formato MM:SS.mmm
+            elif time_str.count(':') == 1:
+                m, s = time_str.split(':')
+                total_seconds = int(m) * 60 + float(s)
+                
+            # Tentar como número puro de segundos
+            else:
+                total_seconds = float(time_str)
+            
+            # Arredondar para 3 casas decimais para evitar erros de ponto flutuante
+            total_seconds = round(total_seconds, 3)    
+            logger.info(f"Timestamp {time_str} convertido para {total_seconds} segundos")
+            return total_seconds
+            
+        except Exception as e:
+            logger.error(f"Erro ao converter timestamp '{time_value}': {e}")
+            return 0.0
+
+    def _format_time(self, seconds: float) -> str:
+        """Converte segundos para o formato HH:MM:SS."""
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _parse_cutting_guide(self, guide_data: dict) -> list:
+        """Analisa o JSON da IA e extrai uma lista de segmentos de corte.
+        
+        Suporta diferentes formatos de guia:
+        1. Formato VSL com 'vsl_final.segmentos'
+        2. Formato YouTube Live com 'cortes_identificados[].segmentos'
+        3. Formato simplificado com apenas 'segmentos'
+        
+        Returns:
+            Uma lista de dicionários onde cada um representa um segmento com:
+            - inicio: tempo de início no formato 'HH:MM:SS.mmm' ou segundos
+            - fim: tempo de fim no formato 'HH:MM:SS.mmm' ou segundos
+            - texto: texto ou função do segmento (opcional)
+        """
+        segments = []
+        
+        # Tentar diferentes formatos de guias conhecidos
+        if 'vsl_final' in guide_data and 'segmentos' in guide_data['vsl_final']:
+            # Formato VSL
+            raw_segments = guide_data['vsl_final']['segmentos']
+            
+            for seg in raw_segments:
+                # Lidar com segmentos normais ou inserções
+                if 'orig' in seg:
+                    # Formato 'inicio-fim'
+                    times = seg['orig'].split('-')
+                    if len(times) == 2:
+                        segment = {
+                            'inicio': times[0].strip(),
+                            'fim': times[1].strip(),
+                            'funcao': seg.get('funcao', 'desconhecido')
+                        }
+                        segments.append(segment)
+                elif 'insert' in seg and 'at' in seg:
+                    # Formato de inserção - tratado como marcador
+                    segments.append({
+                        'inicio': seg['at'],
+                        'fim': seg['at'],  # Mesma posição para marcador
+                        'insert': seg['insert']
+                    })
+                    
+        elif 'cortes_identificados' in guide_data and len(guide_data['cortes_identificados']) > 0:
+            # Formato YouTube Live
+            for corte in guide_data['cortes_identificados']:
+                if 'segmentos' in corte:
+                    for seg in corte['segmentos']:
+                        if 'original' in seg:  # Formato 'inicio-fim'
+                            times = seg['original'].split('-')
+                            if len(times) == 2:
+                                segment = {
+                                    'inicio': times[0].strip(),
+                                    'fim': times[1].strip(),
+                                    'funcao': seg.get('funcao', 'desconhecido')
+                                }
+                                segments.append(segment)
+                                
+        elif 'segmentos' in guide_data and isinstance(guide_data['segmentos'], list):
+            # Formato simplificado direto com segmentos
+            for seg in guide_data['segmentos']:
+                if all(key in seg for key in ['inicio', 'fim']):
+                    segments.append({
+                        'inicio': seg['inicio'],
+                        'fim': seg['fim'],
+                        'texto': seg.get('texto', ''),
+                        'funcao': seg.get('funcao', 'desconhecido')
+                    })
+        
+        if not segments:
+            logger.warning("Não foi possível extrair segmentos do guia de corte. Formato não reconhecido.")
+            logger.debug(f"Dados do guia: {guide_data}")
+            
+        return segments
+
+    def _verify_guide_transcription_compatibility(self, guide_path: str, transcription_path: str) -> Tuple[bool, float]:
+        """Verifica se os timestamps do guia de corte estão alinhados com a transcrição."""
+        return self.guide_generator.verify_guide_transcription_compatibility(guide_path, transcription_path)
+        
+    def _generate_cutting_guide_from_transcription(self, transcription_path: str, video_type: str = "geral") -> str:
+        """Gera um guia de corte a partir da transcrição e salva em arquivo.
+        
+        Args:
+            transcription_path: Caminho do arquivo JSON da transcrição
+            video_type: Tipo de vídeo (vsl, youtube_live, geral)
+            
+        Returns:
+            Caminho do arquivo JSON do guia de corte gerado
+        """
+        # Mapear o tipo de vídeo para o tipo de prompt adequado
+        prompt_type = "geral"
+        if video_type == "vsl":
+            prompt_type = "vsl"
+        elif video_type == "live_cuts" or video_type == "youtube_cuts":
+            prompt_type = "youtube_live"
+        
+        # Gerar o guia de corte
+        cutting_guide = self.guide_generator.generate_cutting_guide(
+            transcription_path=transcription_path, 
+            prompt_type=prompt_type
+        )
+        
+        # Salvar o guia em um arquivo
+        guide_path = os.path.splitext(transcription_path)[0] + '_guide.json'
+        with open(guide_path, 'w', encoding='utf-8') as f:
+            json.dump(cutting_guide, f, ensure_ascii=False, indent=2)
+            
+        # Log detalhado dos segmentos gerados para debug
+        if 'segmentos' in cutting_guide:
+            logger.info(f"Guia de corte gerado com {len(cutting_guide['segmentos'])} segmentos:")
+            for i, seg in enumerate(cutting_guide['segmentos'][:3]):  # Mostrar apenas os primeiros 3
+                logger.info(f"Segmento {i+1}: {seg.get('inicio')} -> {seg.get('fim')}")
+                if 'texto' in seg:
+                    logger.info(f"   Texto: {seg.get('texto')[:50]}...")
+                    
+        logger.info(f"Guia de corte gerado e salvo em {guide_path}")
+        return guide_path
+        
+    def _generate_xml(self, cutting_guide_path: str, file_path: str, transcription_path: Optional[str] = None):
+        """Gera arquivo XML com marcadores no formato do Adobe Premiere."""
+        try:
+            # Verificar compatibilidade entre guia e transcrição se ambos fornecidos
+            if transcription_path:
+                compatible, offset = self._verify_guide_transcription_compatibility(
+                    cutting_guide_path, transcription_path
+                )
+                if not compatible:
+                    logger.warning(f"Detectado desalinhamento entre guia e transcrição! Offset de {offset:.2f}s")
+                    
+                    # Se houver grande desalinhamento, regenerar o guia a partir da transcrição
+                    if abs(offset) > 20.0:
+                        logger.info("Regenerando guia de corte a partir da transcrição original...")
+                        new_guide_path = self._generate_cutting_guide_from_transcription(
+                            transcription_path, 
+                            "geral"  # Usar tipo genérico para regeneração
+                        )
+                        logger.info(f"Usando novo guia de corte: {new_guide_path}")
+                        cutting_guide_path = new_guide_path
+            
+            # Inicializar a lista de segmentos
+            segments = []
+                
+            # Carregar o guia de corte
+            with open(cutting_guide_path, 'r', encoding='utf-8') as f:
+                cutting_guide = json.load(f)
+                
+            # Extrair informações do vídeo usando moviepy
+            video = VideoFileClip(file_path)
+            fps = video.fps
+            duration = video.duration
+            width, height = video.size
+            video_duration_frames = int(round(duration * fps))
+            
+            # Verificar se estamos usando um frame rate padrão para configuração adequada de drop-frame
+            ntsc_rates = [23.976, 29.97, 59.94]
+            drop_frame = False
+            is_ntsc = False
+            
+            # Verificar proximidade com taxas NTSC para decidir sobre drop-frame
+            for ntsc_rate in ntsc_rates:
+                if abs(fps - ntsc_rate) < 0.1:  # Tolerância para arredondamentos
+                    fps = ntsc_rate  # Usar o valor exato do padrão
+                    drop_frame = True
+                    is_ntsc = True
+                    break
+            
+            logger.info(f"Vídeo: FPS={fps}, Duration={duration}s, Drop-Frame={drop_frame}, Frames={video_duration_frames}")
+            
+            # Nome do arquivo apenas, sem o caminho
+            file_filename = os.path.basename(file_path)
+            file_filename_no_ext = os.path.splitext(file_filename)[0]
+            project_name = f"{file_filename_no_ext}_AI_Cuts"
+            
+            # Fechar o vídeo para liberar recursos
+            video.close()
+        except Exception as e:
+            logger.error(f"Erro ao processar arquivo de corte: {e}")
+            raise
+            
+        # Criar estrutura XML
+        xmeml = ET.Element('xmeml', version="4")
+        project = ET.SubElement(xmeml, 'project')
+        ET.SubElement(project, 'name').text = project_name
+        children = ET.SubElement(project, 'children')
+        
+        # Bin for master clip
+        bin_master = ET.SubElement(children, 'bin')
+        ET.SubElement(bin_master, 'name').text = "Master Clips"
+        children_bin_master = ET.SubElement(bin_master, 'children')
+        clip_master = ET.SubElement(children_bin_master, 'clip', id='master_clip')
+        ET.SubElement(clip_master, 'name').text = file_filename
+        ET.SubElement(clip_master, 'duration').text = str(video_duration_frames)
+        rate_master = ET.SubElement(clip_master, 'rate')
+        ET.SubElement(rate_master, 'timebase').text = str(round(fps))
+        ET.SubElement(rate_master, 'ntsc').text = str(is_ntsc).upper()
+
+        # File reference
+        file_id = "master_media_file"
+        file_def = ET.SubElement(clip_master, 'file', id=file_id)
+        ET.SubElement(file_def, 'name').text = file_filename
+        # Usar um caminho absoluto para maior compatibilidade
+        abs_file_path = os.path.abspath(file_path)
+        ET.SubElement(file_def, 'pathurl').text = f'file://{abs_file_path.replace(os.sep, "/")}'
+        
+        # Adicionar uma trilha de marcadores para visualização do texto nos segmentos
+        logger.info("Adicionando trilha de marcadores com textos dos segmentos")
+        rate_file = ET.SubElement(file_def, 'rate')
+        ET.SubElement(rate_file, 'timebase').text = str(round(fps))
+        ET.SubElement(rate_file, 'ntsc').text = str(is_ntsc).upper()
+        ET.SubElement(file_def, 'duration').text = str(video_duration_frames)
+        media_file = ET.SubElement(file_def, 'media')
+        ET.SubElement(media_file, 'video')
+        ET.SubElement(media_file, 'audio')
+
+        # Sequence
+        sequence = ET.SubElement(children, 'sequence', id="ai_sequence")
+        ET.SubElement(sequence, 'name').text = project_name
+        rate_seq = ET.SubElement(sequence, 'rate')
+        ET.SubElement(rate_seq, 'timebase').text = str(round(fps))
+        ET.SubElement(rate_seq, 'ntsc').text = str(is_ntsc).upper()
+        
+        # Timecode
+        timecode = ET.SubElement(sequence, 'timecode')
+        rate_tc = ET.SubElement(timecode, 'rate')
+        ET.SubElement(rate_tc, 'timebase').text = str(round(fps))
+        ET.SubElement(rate_tc, 'ntsc').text = str(is_ntsc).upper()
+        ET.SubElement(timecode, 'string').text = '00:00:00:00'
+        ET.SubElement(timecode, 'frame').text = '0'
+        ET.SubElement(timecode, 'displayformat').text = 'NDF'
+
+        media = ET.SubElement(sequence, 'media')
+        video_track = ET.SubElement(media, 'video')
+        # Adicionar a formatação de vídeo com a resolução correta
+        format_node = ET.SubElement(video_track, 'format')
+        sample_chars = ET.SubElement(format_node, 'samplecharacteristics')
+        ET.SubElement(sample_chars, 'width').text = str(width)
+        ET.SubElement(sample_chars, 'height').text = str(height)
+        audio_track = ET.SubElement(media, 'audio')
+
+        track_video = ET.SubElement(video_track, 'track')
+        track_audio = ET.SubElement(audio_track, 'track')
+        
+        timeline_cursor = 0
+        
+        # Inicializa a lista de segmentos vazia
+        segments = []
+        
+        # Verificar formatos diferentes: 'cortes', 'cortes_identificados', ou 'segmentos' direto
+        if 'cortes' in cutting_guide:
+            # Formato antigo/geral
+            segments = cutting_guide.get('cortes', [])
+            logger.info(f"Detectado formato 'cortes' com {len(segments)} segmentos")
+            
+            # Para o formato 'cortes', garante que estamos usando o campo correto para o texto
+
+for i, segment in enumerate(segments):
+    # Para o clip, precisamos converter tempos para frames
+    start_time = segment.get('inicio', '00:00.000')
+    end_time = segment.get('fim', '00:00.000')
+    
+    # Conversão de tempo para segundos e depois para frames
+    start_seconds = self._time_str_to_seconds(start_time)
+    end_seconds = self._time_str_to_seconds(end_time)
+    
+    # Verificar se temos tempos válidos
+    if start_seconds >= end_seconds:
+        logger.warning(f"Tempo inválido no segmento {i+1}: início {start_time} >= fim {end_time}")
+        continue
+            if texto_segmento:
+                marker = ET.SubElement(sequence, 'marker')
+                ET.SubElement(marker, 'name').text = f"Segmento {i+1}"
+                ET.SubElement(marker, 'comment').text = texto_segmento[:200]  # Limita tamanho para evitar problemas
+                ET.SubElement(marker, 'in').text = str(timeline_cursor - clip_duration)
+                ET.SubElement(marker, 'out').text = str(timeline_cursor)
+
+            # Log detalhado para depuração
+            logger.info(f"Adicionado segmento {i+1} ao XML: {start_time} -> {end_time} (duração: {clip_duration} frames)")
+
+        # Adicionar duração total da sequência
+        ET.SubElement(sequence, 'duration').text = str(timeline_cursor)
+        logger.info(f"Duração total da sequência: {timeline_cursor} frames")
+        
+        # XML final
+        # Adicionar o XML com formatação adequada
+        xml_string = minidom.parseString(ET.tostring(xmeml)).toprettyxml(indent="   ")
+        
+        # Salvar em arquivo
+        xml_output_path = os.path.splitext(file_path)[0] + '_AI_Cuts.xml'
+        with open(xml_output_path, 'w', encoding='utf-8') as f:
+            f.write(xml_string)
+            
+        logger.info(f"XML gerado e salvo em: {xml_output_path}")
+        return xml_output_path
+
+    async def process_video(self, file_path: str, video_type: str, instructions: str):
+        try:
+            await self.manager.send_status_update(self.client_id, "Extraindo áudio...", 10)
+            audio_path = self._extract_audio(file_path)
+            
+            await self.manager.send_status_update(self.client_id, "Transcrevendo áudio...", 30)
+            transcription_result = await self.transcription_service.transcribe_audio(TranscriptionRequest(file_path=audio_path))
+            transcription_path = os.path.splitext(audio_path)[0] + '.json'
+            
+            # Salvar a transcrição completa com timestamps precisos
+            # Converter o objeto TranscriptionResult para dicionário antes de serializar
+            transcription_dict = asdict(transcription_result)
+            with open(transcription_path, 'w', encoding='utf-8') as f:
+                json.dump(transcription_dict, f, ensure_ascii=False, indent=2)
+            
+            # Gerar guia de corte diretamente da transcrição para garantir alinhamento preciso dos timestamps
+            await self.manager.send_status_update(self.client_id, "Gerando guia de corte da transcrição...", 60)
+            guide_path = self._generate_cutting_guide_from_transcription(transcription_path, video_type)
+            logger.info(f"Guia de corte gerado diretamente da transcrição: {guide_path}")
+            
+            # Gerar o XML com os timestamps alinhados
+            await self.manager.send_status_update(self.client_id, "Gerando arquivos finais...", 90)
+            xml_path = self._generate_xml(guide_path, file_path, transcription_path)
+
+            guide_url = f"/temp/{os.path.basename(guide_path)}"
+            xml_url = f"/temp/{os.path.basename(xml_path)}"
+
+            await self.manager.send_status_update(
+                self.client_id, "Concluído", 100, guide_url=guide_url, xml_url=xml_url
+            )
+            return guide_path, xml_path
+        except Exception as e:
+            logger.error(f"Erro no processamento do vídeo: {e}", exc_info=True)
+            await self.manager.send_status_update(self.client_id, f"Erro: {str(e)}", 100)
+            raise
