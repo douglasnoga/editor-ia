@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload e Processamento de Vídeo</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #121212;
+            color: #e0e0e0;
+        }
+        .container {
+            max-width: 1200px;
+        }
+        .box {
+            background-color: #1e1e1e;
+            padding: 2rem;
+            border-radius: 0.5rem;
+            border: 1px solid #333;
+            height: 100%;
+        }
+        .drop-zone {
+            border: 2px dashed #444;
+            border-radius: 0.5rem;
+            padding: 4rem 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: background-color 0.2s ease-in-out;
+        }
+        .drop-zone.drag-over {
+            background-color: #333;
+            border-color: #777;
+        }
+        .form-label {
+            color: #bbb;
+        }
+        .form-control, .form-select {
+            background-color: #2c2c2c;
+            border-color: #444;
+            color: #e0e0e0;
+        }
+        .form-control:focus, .form-select:focus {
+            background-color: #333;
+            border-color: #888;
+            color: #e0e0e0;
+            box-shadow: none;
+        }
+        .progress {
+            background-color: #333;
+        }
+        #file-name {
+            color: #d0d0d0 !important; /* Garante alta visibilidade */
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container my-5">
+        <h1 class="text-center mb-5">Editor IA</h1>
+        <form id="upload-form">
+            <div class="row g-4">
+                <!-- Coluna 1: Upload -->
+                <div class="col-md-4">
+                    <div class="box">
+                        <h3>1. Envie seu arquivo</h3>
+                        <div id="drop-zone" class="drop-zone mt-3">
+                            Arraste e solte o vídeo aqui ou clique para selecionar
+                        </div>
+                        <input type="file" id="file-input" class="d-none" accept="video/*">
+                        <div id="file-name" class="mt-3 text-muted">Nenhum arquivo selecionado.</div>
+                    </div>
+                </div>
+
+                <!-- Coluna 2: Configuração -->
+                <div class="col-md-4">
+                    <div class="box">
+                        <h3>2. Configure a Edição</h3>
+                        <div class="mb-3">
+                            <label for="video-type" class="form-label">Tipo de Edição (Template)</label>
+                            <select id="video-type" name="videoType" class="form-select">
+                                <option value="geral">Geral (Padrão)</option>
+                                <option value="vsl">VSL</option>
+                                <option value="youtube_live_cut">Corte de Live (Youtube)</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label for="instructions" class="form-label">Instruções de Corte (Opcional)</label>
+                            <textarea id="instructions" name="instructions" class="form-control" rows="4"></textarea>
+                        </div>
+                        <button id="process-button" type="submit" class="btn btn-primary w-100" disabled>Selecione um arquivo</button>
+                    </div>
+                </div>
+
+                <!-- Coluna 3: Progresso -->
+                <div class="col-md-4">
+                    <div class="box">
+                        <h3>3. Acompanhe o Progresso</h3>
+                        <div class="progress-container mt-3">
+                            <div id="status">Aguardando arquivo...</div>
+                            <div class="progress mt-1">
+                                <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+                            </div>
+                            <div id="downloadLinks" class="mt-3"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const dropZone = document.getElementById('drop-zone');
+            const fileInput = document.getElementById('file-input');
+            const uploadForm = document.getElementById('upload-form');
+            const statusDiv = document.getElementById('status');
+            const progressBar = document.getElementById('progressBar');
+            const fileNameDiv = document.getElementById('file-name');
+            const processButton = document.getElementById('process-button');
+            const downloadLinksDiv = document.getElementById('downloadLinks');
+
+            let selectedFile = null;
+            let socket = null;
+
+            // Funções de Drag and Drop
+            dropZone.addEventListener('click', () => fileInput.click());
+            dropZone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+            dropZone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('drag-over');
+                const files = e.dataTransfer.files;
+                if (files.length > 0) {
+                    handleFile(files[0]);
+                }
+            });
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length > 0) {
+                    handleFile(e.target.files[0]);
+                }
+            });
+
+            function handleFile(file) {
+                selectedFile = file;
+                fileNameDiv.textContent = `Arquivo selecionado: ${file.name}`;
+                processButton.disabled = false;
+                processButton.textContent = 'Processar';
+                resetProgress();
+            }
+
+            function resetProgress() {
+                statusDiv.textContent = 'Pronto para processar.';
+                progressBar.style.width = '0%';
+                progressBar.setAttribute('aria-valuenow', 0);
+                downloadLinksDiv.innerHTML = '';
+            }
+
+            // Envio do Formulário
+            uploadForm.addEventListener('submit', function (e) {
+                e.preventDefault();
+                if (!selectedFile) {
+                    alert('Por favor, selecione um arquivo de vídeo.');
+                    return;
+                }
+
+                processButton.disabled = true;
+                processButton.textContent = 'Processando...';
+                statusDiv.textContent = 'Iniciando conexão...';
+
+                const clientId = self.crypto.randomUUID();
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${clientId}`);
+
+                socket.onopen = function () {
+                    statusDiv.textContent = 'Conectado! Enviando arquivo...';
+                    const formData = new FormData();
+                    formData.append('file', selectedFile);
+                    formData.append('instructions', document.getElementById('instructions').value);
+                    formData.append('videoType', document.getElementById('video-type').value);
+
+                    fetch(`/api/upload/${clientId}`, {
+                        method: 'POST',
+                        body: formData
+                    }).then(response => {
+                        if (!response.ok) {
+                           statusDiv.textContent = `Erro no upload: ${response.statusText}`;
+                           processButton.disabled = false;
+                           processButton.textContent = 'Processar';
+                        }
+                    }).catch(error => {
+                        statusDiv.textContent = `Erro de rede: ${error}`;
+                        processButton.disabled = false;
+                        processButton.textContent = 'Processar';
+                    });
+                };
+
+                socket.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+
+                    statusDiv.textContent = data.status;
+                    progressBar.style.width = data.progress + '%';
+                    progressBar.setAttribute('aria-valuenow', data.progress);
+
+                    if (data.progress === 100) {
+                        processButton.disabled = false;
+                        processButton.textContent = 'Processar Outro Vídeo';
+
+                        downloadLinksDiv.innerHTML = ''; 
+
+                        if (data.guide_url && data.xml_url) {
+                            statusDiv.textContent = "Processo concluído! Faça o download dos arquivos abaixo.";
+
+                            const guideLink = document.createElement('a');
+                            guideLink.href = data.guide_url;
+                            guideLink.textContent = 'Baixar Guia de Corte (JSON)';
+                            guideLink.className = 'btn btn-success me-2';
+                            guideLink.setAttribute('download', '');
+                            downloadLinksDiv.appendChild(guideLink);
+
+                            const xmlLink = document.createElement('a');
+                            xmlLink.href = data.xml_url;
+                            xmlLink.textContent = 'Baixar Marcadores (XML)';
+                            xmlLink.className = 'btn btn-primary';
+                            xmlLink.setAttribute('download', '');
+                            downloadLinksDiv.appendChild(xmlLink);
+                        } else {
+                             statusDiv.textContent = data.status; 
+                        }
+                    }
+                };
+
+                socket.onerror = function (error) {
+                    statusDiv.textContent = 'Erro na conexão WebSocket.';
+                    console.error('WebSocket Error:', error);
+                    processButton.disabled = false;
+                    processButton.textContent = 'Processar';
+                };
+
+                socket.onclose = function () {
+                    console.log('Conexão WebSocket fechada.');
+                };
+            });
+        });
+    </script>
+</body>
+</html>
