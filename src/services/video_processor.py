@@ -105,19 +105,80 @@ class VideoProcessor:
                 logger.info("Audio conversion completed successfully")
                 
             else:
-                # Handle video files - extract audio
+                # Handle video files - extract audio with multiple fallback strategies
                 logger.info(f"Video file detected: {file_extension}. Extracting audio...")
                 
-                with VideoFileClip(file_path) as video_clip:
-                    if video_clip.audio is None:
-                        raise VideoProcessorError("Video file has no audio track")
-                    
-                    video_clip.audio.write_audiofile(
-                        audio_path, 
-                        codec='pcm_s16le',
-                        verbose=False,
-                        logger=None
+                # Strategy 1: Try FFmpeg directly (most robust for problematic files)
+                try:
+                    logger.info("Trying FFmpeg direct extraction...")
+                    import subprocess
+                    result = subprocess.run([
+                        'ffmpeg', '-y', '-i', file_path, 
+                        '-vn',  # No video
+                        '-acodec', 'pcm_s16le',
+                        '-ar', '16000',  # Sample rate
+                        '-ac', '1',      # Mono
+                        '-ignore_unknown',  # Ignore unknown streams
+                        '-err_detect', 'ignore_err',  # Ignore errors
+                        audio_path
+                    ], 
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=300  # 5 minute timeout
                     )
+                    logger.info("FFmpeg direct extraction successful")
+                    
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    logger.warning(f"FFmpeg direct failed: {e}. Trying MoviePy...")
+                    
+                    # Strategy 2: Try MoviePy with error handling
+                    try:
+                        with VideoFileClip(file_path) as video_clip:
+                            if video_clip.audio is None:
+                                raise VideoProcessorError("Video file has no audio track")
+                            
+                            video_clip.audio.write_audiofile(
+                                audio_path, 
+                                codec='pcm_s16le',
+                                verbose=False,
+                                logger=None
+                            )
+                        logger.info("MoviePy extraction successful")
+                        
+                    except Exception as moviepy_error:
+                        logger.warning(f"MoviePy failed: {moviepy_error}. Trying FFmpeg with repair...")
+                        
+                        # Strategy 3: Try FFmpeg with file repair
+                        try:
+                            # First, try to repair the file
+                            temp_repaired = file_path + '_repaired.mp4'
+                            subprocess.run([
+                                'ffmpeg', '-y', '-i', file_path,
+                                '-c', 'copy',
+                                '-avoid_negative_ts', 'make_zero',
+                                '-fflags', '+genpts',
+                                temp_repaired
+                            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            
+                            # Then extract audio from repaired file
+                            subprocess.run([
+                                'ffmpeg', '-y', '-i', temp_repaired,
+                                '-vn', '-acodec', 'pcm_s16le',
+                                '-ar', '16000', '-ac', '1',
+                                audio_path
+                            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            
+                            # Clean up temp file
+                            if os.path.exists(temp_repaired):
+                                os.remove(temp_repaired)
+                                
+                            logger.info("FFmpeg with repair successful")
+                            
+                        except Exception as repair_error:
+                            logger.error(f"All extraction strategies failed. Last error: {repair_error}")
+                            raise VideoProcessorError(f"Could not extract audio from video file. File may be corrupted or use unsupported codec.")
                 
                 logger.info("Audio extraction completed successfully")
             
@@ -128,6 +189,10 @@ class VideoProcessor:
             
         except subprocess.CalledProcessError as e:
             error_msg = f"FFmpeg error during audio processing: {e.stderr}"
+            logger.error(error_msg)
+            raise VideoProcessorError(error_msg)
+        except subprocess.TimeoutExpired as e:
+            error_msg = f"FFmpeg timeout during audio processing (file too large or complex)"
             logger.error(error_msg)
             raise VideoProcessorError(error_msg)
         except Exception as e:
